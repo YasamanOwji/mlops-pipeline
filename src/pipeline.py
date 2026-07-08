@@ -1,64 +1,187 @@
-"""
-api.py
-------
-FastAPI server for serving the production model.
-Paths are resolved relative to the project root.
-"""
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import pandas as pd
-import mlflow.sklearn
-from pathlib import Path
-import yaml
 import logging
+import subprocess
+import json
+from pathlib import Path
+from typing import Any, Dict
 
-logging.basicConfig(level=logging.INFO)
+import mlflow
+import mlflow.sklearn
+import pandas as pd
+import yaml
+from mlflow.tracking import MlflowClient
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# خواندن کانفیگ از ریشه‌ی پروژه
-root_dir = Path(__file__).resolve().parent.parent
-config_path = root_dir / "config" / "mlops_config.yaml"
-with open(config_path, "r") as f:
-    config = yaml.safe_load(f)
 
-MODEL_PATH = root_dir / config["deployment"]["production_dir"] / "model"
+class MLOpsPipeline:
+    """CI/CD pipeline for training, versioning, and deploying an ML model."""
 
-app = FastAPI(title="Churn Prediction API", version="1.0")
+    def __init__(self, config_path: str = None):
+        if config_path is None:
+            root_dir = Path(__file__).resolve().parent.parent
+            config_path = root_dir / "config" / "mlops_config.yaml"
+        
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.config = yaml.safe_load(f)
 
-try:
-    model = mlflow.sklearn.load_model(str(MODEL_PATH))
-    logger.info("Model loaded from %s", MODEL_PATH)
-except Exception as e:
-    logger.error("Failed to load model: %s", e)
-    model = None
+        mlflow.set_tracking_uri(self.config["mlflow"]["tracking_uri"])
+        mlflow.set_experiment(self.config["mlflow"]["experiment_name"])
+        self.client = MlflowClient()
+        self.root_dir = Path(__file__).resolve().parent.parent
 
+    def version_data(self, data_path: str) -> str:
+        data_path = Path(data_path)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data file not found: {data_path}")
 
-class PredictionRequest(BaseModel):
-    features: dict
+        logger.info("Adding %s to DVC tracking", data_path)
+        subprocess.run(["dvc", "add", str(data_path)], check=True)
 
+        remote_name = self.config["dvc"]["remote_name"]
+        logger.info("Pushing data to DVC remote '%s'", remote_name)
+        subprocess.run(["dvc", "push", "-r", remote_name], check=True)
 
-class PredictionResponse(BaseModel):
-    prediction: int
-    probability: float
+        dvc_file = data_path.with_suffix(data_path.suffix + ".dvc")
+        with open(dvc_file, "r", encoding="utf-8") as f:
+            dvc_meta = yaml.safe_load(f)
+        data_hash = dvc_meta["outs"][0]["md5"]
 
+        logger.info("Data version (md5): %s", data_hash)
+        return data_hash
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "model_loaded": model is not None}
+    def train_and_register(self, data_path: str, data_version: str, model_params: Dict[str, Any]) -> str:
+        df = pd.read_csv(data_path)
+        target_col = self.config["data"]["target_column"]
+        X = df.drop(columns=[target_col, "student_id"], errors="ignore")
+        X = pd.get_dummies(X, drop_first=True)
+        y = df[target_col]
 
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
 
-@app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    try:
-        input_df = pd.DataFrame([request.features])
-        if "student_id" in input_df.columns:
-            input_df.drop(columns=["student_id"], inplace=True)
-        prediction = model.predict(input_df)[0]
-        probability = model.predict_proba(input_df)[0][1]
-        return PredictionResponse(prediction=int(prediction), probability=float(probability))
-    except Exception as e:
-        logger.exception("Prediction failed")
-        raise HTTPException(status_code=400, detail=str(e))
+        with mlflow.start_run() as run:
+            mlflow.log_params(model_params)
+            mlflow.log_param("data_version", data_version)
+
+            model = self._train_model(X_train, y_train, model_params)
+            metrics = self._evaluate_model(model, X_test, y_test)
+            mlflow.log_metrics(metrics)
+
+            mlflow.sklearn.log_model(model, artifact_path="model")
+
+            registered_name = self.config["mlflow"]["registered_model_name"]
+            mlflow.register_model(
+                model_uri=f"runs:/{run.info.run_id}/model",
+                name=registered_name,
+            )
+
+            test_data_path = self.root_dir / "data" / "test_data.csv"
+            test_data_path.parent.mkdir(exist_ok=True)
+            test_df = X_test.copy()
+            test_df[target_col] = y_test
+            test_df.to_csv(test_data_path, index=False)
+            mlflow.log_artifact(str(test_data_path), artifact_path="test_data")
+
+            logger.info("Run %s complete. Metrics: %s", run.info.run_id, metrics)
+            return run.info.run_id
+
+    def _train_model(self, X_train, y_train, model_params: Dict[str, Any]):
+        model = RandomForestClassifier(**model_params)
+        model.fit(X_train, y_train)
+        return model
+
+    def _evaluate_model(self, model, X_test, y_test) -> Dict[str, float]:
+        preds = model.predict(X_test)
+        proba = model.predict_proba(X_test)[:, 1]
+        return {
+            "accuracy": accuracy_score(y_test, preds),
+            "f1_score": f1_score(y_test, preds),
+            "roc_auc": roc_auc_score(y_test, proba),
+        }
+
+    def deploy_model(self, run_id: str, environment: str = "staging") -> str:
+        registered_name = self.config["mlflow"]["registered_model_name"]
+
+        versions = self.client.search_model_versions(f"name='{registered_name}'")
+        matching = [v for v in versions if v.run_id == run_id]
+        if not matching:
+            raise ValueError(f"No registered model version found for run_id={run_id}")
+        version = matching[0].version
+
+        model_uri = f"runs:/{run_id}/model"
+
+        if environment == "production":
+            logger.info("Promoting version %s of '%s' to Production", version, registered_name)
+            self.client.transition_model_version_stage(
+                name=registered_name,
+                version=version,
+                stage="Production",
+                archive_existing_versions=True,
+            )
+            target_dir = self.root_dir / self.config["deployment"]["production_dir"]
+        else:
+            logger.info("Deploying version %s of '%s' to staging", version, registered_name)
+            self.client.transition_model_version_stage(
+                name=registered_name,
+                version=version,
+                stage="Staging",
+            )
+            target_dir = self.root_dir / self.config["deployment"]["staging_dir"]
+
+        self._materialize_model(model_uri, target_dir)
+        return str(target_dir)
+
+    def _materialize_model(self, model_uri: str, target_dir: Path) -> None:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        mlflow.sklearn.save_model(mlflow.sklearn.load_model(model_uri), str(target_dir / "model"))
+        with open(target_dir / "version.txt", "w") as f:
+            f.write(model_uri)
+        logger.info("Model artifact written to %s", target_dir)
+
+    def run_monitoring(self, production_model_path: str, new_data_path: str, reference_data_path: str = None) -> dict:
+        if reference_data_path is None:
+            reference_data_path = self.root_dir / "data" / "test_data.csv"
+
+        ref_df = pd.read_csv(reference_data_path)
+        new_df = pd.read_csv(new_data_path)
+
+        target_col = self.config["data"]["target_column"]
+
+        drift_score = 0.0
+        quality_metrics = {}
+
+        if target_col in new_df.columns:
+            model_path = Path(production_model_path) / "model"
+            if model_path.exists():
+                model = mlflow.sklearn.load_model(str(model_path))
+                X_new = new_df.drop(columns=[target_col, "student_id"], errors="ignore")
+                X_new = pd.get_dummies(X_new, drop_first=True)
+                common_cols = list(set(ref_df.columns) & set(X_new.columns))
+                if common_cols:
+                    X_new = X_new[common_cols]
+                    y_true = new_df[target_col]
+                    y_pred = model.predict(X_new)
+                    quality_metrics = {
+                        "accuracy": accuracy_score(y_true, y_pred),
+                        "f1_score": f1_score(y_true, y_pred),
+                    }
+
+        report_dir = self.root_dir / self.config["monitoring"]["report_dir"]
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"monitoring_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_path, "w") as f:
+            json.dump({"drift_score": drift_score, "quality": quality_metrics}, f, indent=2)
+
+        with mlflow.start_run(run_name="monitoring") as monitor_run:
+            mlflow.log_metric("drift_score", drift_score)
+            for k, v in quality_metrics.items():
+                mlflow.log_metric(f"quality_{k}", v)
+            mlflow.log_artifact(str(report_path))
+
+        logger.info("Monitoring report saved to %s", report_path)
+        return {"drift_score": drift_score, "quality": quality_metrics}
